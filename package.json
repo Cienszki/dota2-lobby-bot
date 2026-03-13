@@ -1,0 +1,30 @@
+{
+  "name": "dota2-lobby-bot-worker",
+  "version": "1.0.0",
+  "description": "Dota 2 lobby bot worker process for dota2inhouse.pl",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "manager": "tsx src/manager.ts",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start:built": "node dist/index.js",
+    "manager:built": "node dist/manager.js",
+    "lint": "eslint src/"
+  },
+  "dependencies": {
+    "dota2": "^7.0.3",
+    "steam-user": "^5.0.0",
+    "firebase-admin": "^12.0.0",
+    "dotenv": "^16.4.0",
+    "protobufjs": "^4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
