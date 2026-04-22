@@ -3,6 +3,7 @@
 
 import type { Firestore } from 'firebase-admin/firestore';
 import type { DotaClient } from './dota-client.js';
+import type { EventBridge } from './event-emitter.js';
 import { logger } from './logger.js';
 
 interface BotCommand {
@@ -35,7 +36,8 @@ export class CommandHandler {
     private db: Firestore,
     private botAccountId: string,
     private dotaClient: DotaClient,
-    private pollIntervalMs: number = 2000
+    private pollIntervalMs: number = 2000,
+    private eventBridge?: EventBridge
   ) {}
 
   /**
@@ -151,7 +153,10 @@ export class CommandHandler {
           serverRegion: (settings.serverRegion as number) || 8,
           visibility: (settings.visibility as number) || 2,
           dotaTvDelay: (settings.dotaTvDelay as number) || 120,
-          seriesType: (settings.seriesType as number) || 0,
+          // Session-level seriesType (from match format) overrides global lobby config
+          seriesType: (command.seriesTypeOverride as number) ?? (settings.seriesType as number) ?? 0,
+          radiantSeriesWins: command.radiantSeriesWins as number | undefined,
+          direSeriesWins: command.direSeriesWins as number | undefined,
           leagueId: settings.leagueId as number | undefined,
           cheatsEnabled: (settings.cheatsEnabled as boolean) || false,
           fillWithBots: (settings.fillWithBots as boolean) || false,
@@ -171,9 +176,65 @@ export class CommandHandler {
       }
 
       case 'invite_players': {
-        const steamIds = command.steamIds as string[];
+        // Optional team assignments: if provided, configure auto-kick + slot validation
+        // before sending any invites so the guard is active from the moment players join.
+        const teamA = command.teamA as string[] | undefined;
+        const teamB = command.teamB as string[] | undefined;
+        const whitelist = command.whitelist as string[] | undefined;
+        if (teamA && teamB) {
+          this.dotaClient.setSessionTeams(teamA, teamB, whitelist ?? []);
+        }
+        // Support both flat steamIds array and derived from teamA+teamB
+        const steamIds: string[] = teamA && teamB
+          ? [...teamA, ...teamB]
+          : (command.steamIds as string[]);
         await this.dotaClient.invitePlayers(steamIds);
+
+        // Configure EventBridge for this session
+        if (this.eventBridge) {
+          // Wire custom bot commands
+          const customCommands = command.customCommands as Array<{ trigger: string; response: string }> | undefined;
+          this.eventBridge.setCustomCommands(customCommands ?? []);
+
+          // Wire late arrival timer
+          const latePolicy = command.latePolicy as Record<string, unknown> | undefined;
+          const scheduledMatchTime = command.scheduledMatchTime as string | undefined;
+          if (latePolicy?.enabled && scheduledMatchTime && teamA && teamB) {
+            const radiantTeamName = (command.radiantTeamName as string | undefined) ?? 'Radiant';
+            const direTeamName = (command.direTeamName as string | undefined) ?? 'Dire';
+            this.eventBridge.startLateTimer({
+              scheduledMatchTime: new Date(scheduledMatchTime),
+              radiantSteamIds: teamA,
+              direSteamIds: teamB,
+              radiantTeamName,
+              direTeamName,
+              game1ForfeitMinutes: (latePolicy.game1ForfeitMinutes as number) ?? 15,
+              seriesForfeitMinutes: (latePolicy.seriesForfeitMinutes as number) ?? 30,
+              waitCommands: (latePolicy.waitCommands as string[]) ?? ['!wait'],
+              forfeitCommands: (latePolicy.forfeitCommands as string[]) ?? ['!forfeit'],
+              votingWindowSeconds: (latePolicy.votingWindowSeconds as number) ?? 60,
+              requiredVotesForForfeit: (latePolicy.requiredVotesForForfeit as number) ?? 3,
+              lateGame1AnnouncementTemplate: (latePolicy.lateGame1AnnouncementTemplate as string) ?? (latePolicy.lateAnnouncementTemplate as string) ?? '{late_team} is late (game 1). {present_team}, vote: {wait_cmd} to wait or {forfeit_cmd} to forfeit. {window}s window.',
+              lateSeriesAnnouncementTemplate: (latePolicy.lateSeriesAnnouncementTemplate as string) ?? (latePolicy.lateAnnouncementTemplate as string) ?? '{late_team} is late (series). {present_team}, vote: {wait_cmd} to wait or {forfeit_cmd} to forfeit. {window}s window.',
+              waitResultTemplate: (latePolicy.waitResultTemplate as string) ?? 'Vote: wait. Extra {extra} minutes for {loser_team}.',
+              forfeitGame1Template: (latePolicy.forfeitGame1Template as string) ?? 'Game 1 forfeit: {winner_team} wins!',
+              forfeitSeriesTemplate: (latePolicy.forfeitSeriesTemplate as string) ?? 'Series forfeit: {winner_team} wins!',
+              noVoteResultTemplate: (latePolicy.noVoteResultTemplate as string) ?? 'Not enough votes ({votes}/{required}). Waiting for admin.',
+            });
+          }
+        }
+
         return { invited: steamIds.length };
+      }
+
+      case 'set_teams': {
+        // Standalone command to configure team assignments without re-inviting.
+        // Useful when teams are known before the lobby is created.
+        const teamA = command.teamA as string[];
+        const teamB = command.teamB as string[];
+        const whitelist = command.whitelist as string[] | undefined;
+        this.dotaClient.setSessionTeams(teamA, teamB, whitelist ?? []);
+        return { teamsSet: true, teamACount: teamA.length, teamBCount: teamB.length };
       }
 
       case 'send_chat': {

@@ -2,8 +2,14 @@
 // Emits structured events back to Firestore for the Next.js orchestrator to process
 
 import type { Firestore } from 'firebase-admin/firestore';
-import type { DotaClient, LobbyPlayerInfo, LobbyChatMessage } from './dota-client.js';
+import type { DotaClient, LobbyPlayerInfo, LobbyChatMessage, TeamSlotValidation } from './dota-client.js';
+import { LateTimer, type LateTimerConfig } from './late-timer.js';
 import { logger } from './logger.js';
+
+interface CustomBotCommand {
+  trigger: string;
+  response: string;
+}
 
 /**
  * Bridges DotaClient events → Firestore event documents.
@@ -14,6 +20,10 @@ export class EventBridge {
   private currentSessionId: string | null = null;
   private previousPlayers: Map<string, LobbyPlayerInfo> = new Map();
   private gameDetected = false;
+  /** Tracks whether slot validation has already emitted a slots_ready event this session */
+  private slotsReadyEmitted = false;
+  private customCommands: CustomBotCommand[] = [];
+  private lateTimer: LateTimer | null = null;
 
   constructor(
     private db: Firestore,
@@ -21,6 +31,49 @@ export class EventBridge {
     private dotaClient: DotaClient,
     private heartbeatIntervalMs: number = 30000
   ) {}
+
+  /** Replace the active custom command list (called after invite_players). */
+  setCustomCommands(cmds: CustomBotCommand[]): void {
+    this.customCommands = cmds;
+  }
+
+  /** Create and start a LateTimer for the current session. */
+  startLateTimer(cfg: LateTimerConfig): void {
+    this.lateTimer?.cancel();
+    this.lateTimer = new LateTimer(cfg, {
+      onSendChat: async (msg) => {
+        await this.dotaClient.sendChatMessage(msg);
+      },
+      onForfeitDeclared: async (result) => {
+        await this.emitEvent({
+          type: 'forfeit_declared',
+          sessionId: this.currentSessionId,
+          forfeitType: result.forfeitType,
+          forfeitedTeam: result.forfeitedTeam,
+          forfeitedTeamName: result.forfeitedTeamName,
+          winnerTeamName: result.winnerTeamName,
+          timestamp: new Date().toISOString(),
+        });
+      },
+      onBothTeamsAbsent: async () => {
+        await this.emitEvent({
+          type: 'both_teams_absent',
+          sessionId: this.currentSessionId,
+          timestamp: new Date().toISOString(),
+        });
+      },
+      onWaitVotePassed: async (waitUntil) => {
+        await this.emitEvent({
+          type: 'wait_vote_passed',
+          sessionId: this.currentSessionId,
+          waitUntil: waitUntil.toISOString(),
+          timestamp: new Date().toISOString(),
+        });
+      },
+    });
+    this.lateTimer.start();
+    logger.info('EventBridge: LateTimer started');
+  }
 
   /**
    * Start listening to Dota 2 client events and bridging them to Firestore
@@ -33,8 +86,20 @@ export class EventBridge {
       players: LobbyPlayerInfo[];
       radiantTeamName: string;
       direTeamName: string;
+      slotValidation: TeamSlotValidation | null;
     }) => {
       this.handleLobbyUpdate(data);
+    });
+
+    // Auto-kicked uninvited player
+    this.dotaClient.on('playerKicked', (data: { accountId: number; steamId64: string; reason: string }) => {
+      this.emitEvent({
+        type: 'player_kicked',
+        sessionId: this.currentSessionId,
+        steamId32: String(data.accountId),
+        reason: data.reason,
+        timestamp: new Date().toISOString(),
+      });
     });
 
     // Chat messages
@@ -78,6 +143,8 @@ export class EventBridge {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
     }
+    this.lateTimer?.cancel();
+    this.lateTimer = null;
     this.dotaClient.removeAllListeners();
     logger.info('EventBridge: Stopped');
   }
@@ -89,15 +156,20 @@ export class EventBridge {
     this.currentSessionId = sessionId;
     this.previousPlayers.clear();
     this.gameDetected = false;
+    this.slotsReadyEmitted = false;
   }
 
   /**
    * Clear the current session (when session is complete)
    */
   clearSession(): void {
+    this.lateTimer?.cancel();
+    this.lateTimer = null;
+    this.customCommands = [];
     this.currentSessionId = null;
     this.previousPlayers.clear();
     this.gameDetected = false;
+    this.slotsReadyEmitted = false;
   }
 
   // ─── Event Handlers ────────────────────────────────────────────────
@@ -106,6 +178,7 @@ export class EventBridge {
     players: LobbyPlayerInfo[];
     radiantTeamName: string;
     direTeamName: string;
+    slotValidation: TeamSlotValidation | null;
   }): Promise<void> {
     if (!this.currentSessionId) return;
 
@@ -156,6 +229,12 @@ export class EventBridge {
     // Update state
     this.previousPlayers = currentPlayerMap;
 
+    // Feed current player snapshot to the late arrival timer
+    this.lateTimer?.updatePlayers(data.players.map((p) => ({
+      steamId32: p.steamId32,
+      team: p.team,
+    })));
+
     // Emit full lobby state update
     await this.emitEvent({
       type: 'lobby_state_update',
@@ -167,12 +246,38 @@ export class EventBridge {
       })),
       radiantTeamName: data.radiantTeamName,
       direTeamName: data.direTeamName,
+      slotValidation: data.slotValidation ?? null,
       timestamp: new Date().toISOString(),
     });
+
+    // One-shot: emit slots_ready when all players first get into correct positions
+    if (data.slotValidation?.ready && !this.slotsReadyEmitted) {
+      this.slotsReadyEmitted = true;
+      await this.emitEvent({
+        type: 'slots_ready',
+        sessionId: this.currentSessionId,
+        teamASide: data.slotValidation.teamASide,
+        teamBSide: data.slotValidation.teamBSide,
+        timestamp: new Date().toISOString(),
+      });
+      logger.info(`Slot validation: both teams ready — game can be started`);
+    }
   }
 
   private async handleChatMessage(msg: LobbyChatMessage): Promise<void> {
     if (!this.currentSessionId) return;
+
+    // Check custom bot commands first (case-insensitive, exact match)
+    const normalized = msg.message.trim().toLowerCase();
+    for (const cmd of this.customCommands) {
+      if (normalized === cmd.trigger.toLowerCase()) {
+        await this.dotaClient.sendChatMessage(cmd.response);
+        return; // Don't forward bot-handled messages to Firestore
+      }
+    }
+
+    // Forward chat message to late arrival timer for vote counting
+    this.lateTimer?.handleChatMessage(msg.steamId32, msg.message);
 
     await this.emitEvent({
       type: 'chat_message',
@@ -180,6 +285,10 @@ export class EventBridge {
       steamId32: msg.steamId32,
       playerName: msg.playerName,
       message: msg.message,
+      currentPlayers: [...this.previousPlayers.values()].map((p) => ({
+        steamId32: p.steamId32,
+        teamSide: p.team as 'radiant' | 'dire' | 'spectator' | 'unassigned',
+      })),
       timestamp: new Date().toISOString(),
     });
   }
@@ -209,6 +318,9 @@ export class EventBridge {
 
     if (!this.gameDetected && tvData) {
       this.gameDetected = true;
+      // Game has started — cancel any pending late arrival timers
+      this.lateTimer?.cancel();
+      this.lateTimer = null;
       const matchId = tvData.match_id || tvData.matchid;
       if (matchId) {
         await this.emitEvent({

@@ -96,18 +96,20 @@ async function main(): Promise<void> {
   const pollInterval = parseInt(process.env.POLL_INTERVAL_MS || '2000', 10);
   const heartbeatInterval = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '30000', 10);
 
-  const commandHandler = new CommandHandler(
-    db,
-    botAccountId,
-    dotaClient,
-    pollInterval
-  );
-
+  // EventBridge must be created first so CommandHandler can reference it
   const eventBridge = new EventBridge(
     db,
     botAccountId,
     dotaClient,
     heartbeatInterval
+  );
+
+  const commandHandler = new CommandHandler(
+    db,
+    botAccountId,
+    dotaClient,
+    pollInterval,
+    eventBridge
   );
 
   // Start processing

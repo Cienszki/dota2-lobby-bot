@@ -14,13 +14,16 @@
   },
   "dependencies": {
     "dota2": "^7.0.3",
-    "steam-user": "^5.0.0",
-    "firebase-admin": "^12.0.0",
     "dotenv": "^16.4.0",
-    "protobufjs": "^4.1"
+    "firebase-admin": "^12.0.0",
+    "protobufjs": "^4.1",
+    "steam-resources": "^1.0.0",
+    "steam-totp": "^2.1.2",
+    "steam-user": "^5.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@types/steam-totp": "^2.1.2",
     "tsx": "^4.0.0",
     "typescript": "^5.3.0"
   },

@@ -1,14 +1,16 @@
 // bot-worker/src/dota-client.ts
 // Dota 2 client wrapper — manages Steam login and Dota 2 GC connection
 //
-// This module wraps `steam-user` and `dota2` (node-dota2) to provide
-// a clean interface for lobby management.
+// IMPORTANT: `dota2@7.0.3` (node-dota2) is built on top of the OLD `steam`
+// npm package (not the modern `steam-user`). It internally does:
+//   new steam.SteamUser(steamClient)
+//   new steam.SteamGameCoordinator(steamClient, 570)
+// So we MUST pass an old `steam.SteamClient` instance, not a `steam-user` instance.
 //
-// NOTE: The `dota2` npm package provides protobuf-based communication
-// with Valve's Game Coordinator (GC). Key APIs used:
+// Key Dota2 GC APIs used:
 // - Dota2.createPracticeLobby()  — create a custom lobby
-// - Dota2.inviteToLobby()        — invite a player by Steam ID
-// - Dota2.practiceLobbyKick()    — kick a player
+// - Dota2.inviteToLobby()        — invite a player by Steam64 ID
+// - Dota2.practiceLobbyKick()    — kick a player by Steam32 account ID
 // - Dota2.launchPracticeLobby()  — start the game (coin toss)
 // - Dota2.leavePracticeLobby()   — leave/destroy the lobby
 // - Dota2.sendMessage()          — send a chat message in lobby
@@ -19,18 +21,19 @@
 // - 'chatMessage'          — someone sent a chat message
 // - 'sourceTVGamesData'    — live game data (when spectating)
 
-import SteamUser from 'steam-user';
-import * as Dota2 from 'dota2';
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const Steam = require('steam');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const Dota2 = require('dota2');
+
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { EventEmitter } from 'events';
 import { logger } from './logger.js';
 
-// Dota 2 GC enums (from node-dota2)
-const {
-  EServerRegion,
-  DOTA_GameMode,
-  DOTALobbyVisibility,
-  schema,
-} = Dota2;
+// Path for persisting the Steam sentry file
+const SENTRY_PATH = path.join(process.cwd(), '.steam-sentry');
 
 /** Lobby slot mapping */
 const SLOT = {
@@ -45,6 +48,7 @@ const SLOT = {
 export interface DotaClientConfig {
   username: string;
   password: string;
+  /** @deprecated Steam Guard is disabled on bot accounts — kept for future use */
   steamGuardSharedSecret?: string;
 }
 
@@ -56,6 +60,10 @@ export interface LobbyCreateOptions {
   visibility: number;     // 0=public, 1=friends, 2=unlisted
   dotaTvDelay: number;    // seconds
   seriesType: number;     // 0=none, 1=bo3, 2=bo5
+  /** Current Radiant wins to show in series score UI (0 for game 1) */
+  radiantSeriesWins?: number;
+  /** Current Dire wins to show in series score UI (0 for game 1) */
+  direSeriesWins?: number;
   leagueId?: number;
   cheatsEnabled: boolean;
   fillWithBots: boolean;
@@ -78,21 +86,70 @@ export interface LobbyChatMessage {
   message: string;
 }
 
+/** Result of checking whether both teams have all 5 players seated on the same side */
+export interface TeamSlotValidation {
+  /** True when all 10 players are correctly seated: each team cohesively on one side */
+  ready: boolean;
+  /** Which side Team A is on ('radiant' | 'dire' | null if split or incomplete) */
+  teamASide: 'radiant' | 'dire' | null;
+  /** Which side Team B is on */
+  teamBSide: 'radiant' | 'dire' | null;
+  /** Number of Team A players currently in a player slot (Radiant or Dire) */
+  teamAPresent: number;
+  /** Number of Team B players currently in a player slot */
+  teamBPresent: number;
+  /** Steam32 IDs of Team A players not yet seated in any slot */
+  teamAMissingIds: string[];
+  /** Steam32 IDs of Team B players not yet seated in any slot */
+  teamBMissingIds: string[];
+  /** True when Team A players are split across both sides */
+  teamASplit: boolean;
+  /** True when Team B players are split across both sides */
+  teamBSplit: boolean;
+}
+
 /**
  * Wraps Steam + Dota 2 client for lobby management.
  * Emits high-level events that map to BotEvent types.
+ *
+ * Uses the OLD `steam` npm package (a transitive dep of dota2@7.0.3) because
+ * that is what dota2 expects. Modern `steam-user` is incompatible.
  */
 export class DotaClient extends EventEmitter {
-  private steam: SteamUser;
-  private dota2: InstanceType<typeof Dota2.Dota2Client>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private steamClient: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private steamUser: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private steamFriends: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private dota2: any;
   private _connected = false;
   private _inDota = false;
   private _currentLobby: unknown = null;
+  private _lobbyChannelName: string | null = null;
+  // DOTAChatChannelType_t.DOTAChannelType_Lobby = 3 (confirmed from dota2 schema)
+  private readonly LOBBY_CHAT_TYPE = 3;
+  // Tracks Steam64 IDs of members already seen — used to detect new joiners
+  private _knownMemberIds = new Set<string>();
+  // Bot's own Steam32 ID — set after login to filter own events and skip auto-kick
+  private _botSteam32: string | null = null;
+  // Steam32 IDs of all players allowed in the lobby (empty = no restriction)
+  private _allowedSteamId32s = new Set<string>();
+  // Team assignments for slot validation
+  private _teamA = new Set<string>();
+  private _teamB = new Set<string>();
 
   constructor(private config: DotaClientConfig) {
     super();
-    this.steam = new SteamUser();
-    this.dota2 = new Dota2.Dota2Client(this.steam, true, true);
+    this.steamClient  = new Steam.SteamClient();
+    this.steamUser    = new Steam.SteamUser(this.steamClient);
+    this.steamFriends = new Steam.SteamFriends(this.steamClient);
+    this.dota2        = new Dota2.Dota2Client(this.steamClient, true, false);
+    // Patch schema enums absent from our manually-built steam-resources
+    if (!Dota2.schema.DOTAGameVersion) {
+      Dota2.schema.DOTAGameVersion = { GAME_VERSION_STABLE: 0, GAME_VERSION_TEST: 1 };
+    }
     this.setupEventHandlers();
   }
 
@@ -108,20 +165,50 @@ export class DotaClient extends EventEmitter {
         reject(new Error('Connection timeout (60s)'));
       }, 60000);
 
-      this.steam.logOn({
-        accountName: this.config.username,
+      const logOnDetails: Record<string, unknown> = {
+        account_name: this.config.username,
         password: this.config.password,
-        ...(this.config.steamGuardSharedSecret
-          ? { twoFactorCode: this.config.steamGuardSharedSecret }
-          : {}),
+      };
+
+      // Load sentry file if present (avoids Steam Guard email on repeat logins)
+      try {
+        const sentry = fs.readFileSync(SENTRY_PATH);
+        if (sentry.length) logOnDetails.sha_sentryfile = sentry;
+      } catch { /* no sentry yet — first login */ }
+
+      this.steamClient.connect();
+
+      this.steamClient.on('connected', () => {
+        logger.info('Steam: Connected to network');
+        this.steamUser.logOn(logOnDetails);
       });
 
-      this.steam.on('loggedOn', () => {
-        logger.info('Steam: Logged in successfully');
-        this._connected = true;
-        // Set status to Online and launch Dota 2
-        this.steam.setPersona(SteamUser.EPersonaState.Online);
-        this.steam.gamesPlayed([570]); // Dota 2 App ID
+      this.steamClient.on('logOnResponse', (resp: { eresult: number }) => {
+        if (resp.eresult === Steam.EResult.OK) {
+          logger.info('Steam: Logged in successfully');
+          this._connected = true;
+          // Capture bot's own Steam32 to filter own events and skip auto-kick logic
+          if (this.steamClient.steamID) {
+            this._botSteam32 = String(this.steam64ToSteam32(this.steamClient.steamID));
+            logger.debug(`Bot Steam32: ${this._botSteam32}`);
+          }
+          // Launch the Dota 2 GC connection
+          this.dota2.launch();
+        } else {
+          clearTimeout(timeout);
+          reject(new Error(`Steam login failed: EResult = ${resp.eresult}`));
+        }
+      });
+
+      // Save sentry file to skip Steam Guard on future logins
+      this.steamUser.on('updateMachineAuth', (
+        sentry: { bytes: Buffer },
+        callback: (arg: { sha_file: Buffer }) => void
+      ) => {
+        const hashed = crypto.createHash('sha1').update(sentry.bytes).digest();
+        fs.writeFileSync(SENTRY_PATH, hashed);
+        logger.debug('Steam: Sentry file saved');
+        callback({ sha_file: hashed });
       });
 
       this.dota2.on('ready', () => {
@@ -131,7 +218,7 @@ export class DotaClient extends EventEmitter {
         resolve();
       });
 
-      this.steam.on('error', (err: Error) => {
+      this.steamClient.on('error', (err: Error) => {
         logger.error('Steam: Connection error', err);
         this._connected = false;
         clearTimeout(timeout);
@@ -149,7 +236,7 @@ export class DotaClient extends EventEmitter {
       }
     }
     this.dota2.exit();
-    this.steam.logOff();
+    this.steamClient.disconnect();
     this._connected = false;
     this._inDota = false;
     logger.info('Disconnected from Steam/Dota 2');
@@ -171,7 +258,7 @@ export class DotaClient extends EventEmitter {
         game_mode: options.gameMode,
         server_region: options.serverRegion,
         visibility: options.visibility,
-        dota_tv_delay: Math.floor(options.dotaTvDelay / 30), // Convert seconds to Dota TV delay enum
+        dota_tv_delay: this.dotaTvSecondsToEnum(options.dotaTvDelay),
         series_type: options.seriesType,
         allow_cheats: options.cheatsEnabled,
         fill_with_bots: options.fillWithBots,
@@ -179,34 +266,171 @@ export class DotaClient extends EventEmitter {
         pause_setting: options.pauseSetting,
       };
 
+      if (options.radiantSeriesWins !== undefined) {
+        lobbyOptions.radiant_series_wins = options.radiantSeriesWins;
+      }
+      if (options.direSeriesWins !== undefined) {
+        lobbyOptions.dire_series_wins = options.direSeriesWins;
+      }
+
       if (options.leagueId) {
         lobbyOptions.leagueid = options.leagueId;
       }
 
       this.dota2.createPracticeLobby(
         lobbyOptions,
-        (err: Error | null, body: unknown) => {
+        (err: Error | null) => {
           clearTimeout(timeout);
           if (err) {
             logger.error('Failed to create lobby', err);
             reject(err);
           } else {
-            logger.info('Lobby created successfully');
-            resolve();
+            // Join the lobby chat channel so sendChatMessage works
+            const lobbyId = String(this.dota2.Lobby?.lobby_id ?? '');
+            this._lobbyChannelName = `Lobby_${lobbyId}`;
+            this.dota2.joinChat(this._lobbyChannelName, this.LOBBY_CHAT_TYPE);
+            logger.info(`Lobby created — joined chat channel ${this._lobbyChannelName}`);
+            // Move bot out of Radiant slot 1 and into the unassigned player pool
+            // so it doesn’t occupy a slot meant for human players.
+            // joinPracticeLobbyTeam(slot, team): DOTA_GC_TEAM_PLAYER_POOL = 4
+            this.dota2.joinPracticeLobbyTeam(1, 4);
+            logger.info('Bot moved to unassigned player pool');
+            // Give GC 1.5s to acknowledge chat join + team slot change before callers use them
+            setTimeout(resolve, 1500);
           }
         }
       );
     });
   }
 
+  /**
+   * Configure which players are expected in this match lobby.
+   * - Auto-kicks anyone who joins whose Steam32 is not in teamA or teamB.
+   * - Enables slot validation in lobbyUpdate events.
+   *
+   * Call this before inviting players so the guard is active from the start.
+   * Teams may be on either side (Radiant/Dire) — only cohesion per team matters.
+   */
+  setSessionTeams(teamA: string[], teamB: string[], whitelist: string[] = []): void {
+    this._teamA = new Set(teamA);
+    this._teamB = new Set(teamB);
+    this._allowedSteamId32s = new Set([...teamA, ...teamB, ...whitelist]);
+    logger.info(
+      `Session teams set: TeamA(${teamA.length}) TeamB(${teamB.length}) Whitelist(${whitelist.length}) — ` +
+      `auto-kick enabled for uninvited players`
+    );
+  }
+
+  /** Clear session team data (call after lobby ends) */
+  clearSessionTeams(): void {
+    this._teamA.clear();
+    this._teamB.clear();
+    this._allowedSteamId32s.clear();
+  }
+
+  /**
+   * Validate whether both teams have all 5 players seated on a single side.
+   * Returns null when no teams have been configured via setSessionTeams().
+   *
+   * Rules:
+   * - Team A's 5 players must ALL be on Radiant (slots 0-4) or ALL on Dire (slots 5-9)
+   * - Team B's 5 players must all be on the OTHER side
+   * - The specific side each team occupies doesn't matter
+   * - Within a side, slot order doesn't matter
+   */
+  validateTeamSlots(): TeamSlotValidation | null {
+    if (this._teamA.size === 0) return null;
+
+    const lobby = this._currentLobby as Record<string, unknown> | null;
+    if (!lobby) return null;
+
+    const members = (lobby.all_members || lobby.members || []) as Array<Record<string, unknown>>;
+
+    const seatedRadiant = new Set<string>();
+    const seatedDire    = new Set<string>();
+
+    for (const m of members) {
+      const accountId = this.steam64ToSteam32(m.id);
+      const steam32   = String(accountId);
+      // Skip bot itself and invalid entries
+      if (accountId <= 0 || steam32 === this._botSteam32) continue;
+
+      const slot = Number(m.slot ?? m.team_slot ?? -1);
+      if (slot >= SLOT.RADIANT_START && slot <= SLOT.RADIANT_END) {
+        seatedRadiant.add(steam32);
+      } else if (slot >= SLOT.DIRE_START && slot <= SLOT.DIRE_END) {
+        seatedDire.add(steam32);
+      }
+    }
+
+    const teamAOnRadiant = [...this._teamA].filter((id) => seatedRadiant.has(id)).length;
+    const teamAOnDire    = [...this._teamA].filter((id) => seatedDire.has(id)).length;
+    const teamBOnRadiant = [...this._teamB].filter((id) => seatedRadiant.has(id)).length;
+    const teamBOnDire    = [...this._teamB].filter((id) => seatedDire.has(id)).length;
+
+    // Scenario 1: Team A → Radiant, Team B → Dire
+    const scenario1 =
+      teamAOnRadiant === 5 && teamAOnDire === 0 &&
+      teamBOnDire    === 5 && teamBOnRadiant === 0;
+    // Scenario 2: Team A → Dire, Team B → Radiant
+    const scenario2 =
+      teamAOnDire    === 5 && teamAOnRadiant === 0 &&
+      teamBOnRadiant === 5 && teamBOnDire    === 0;
+
+    const ready = scenario1 || scenario2;
+
+    const teamASide: 'radiant' | 'dire' | null =
+      scenario1 ? 'radiant' : scenario2 ? 'dire' : null;
+    const teamBSide: 'radiant' | 'dire' | null =
+      scenario1 ? 'dire' : scenario2 ? 'radiant' : null;
+
+    const seatedBoth    = new Set([...seatedRadiant, ...seatedDire]);
+    const teamAMissingIds = [...this._teamA].filter((id) => !seatedBoth.has(id));
+    const teamBMissingIds = [...this._teamB].filter((id) => !seatedBoth.has(id));
+
+    // A team is "split" if its players are distributed across both sides
+    const teamASplit = teamAOnRadiant > 0 && teamAOnDire > 0;
+    const teamBSplit = teamBOnRadiant > 0 && teamBOnDire > 0;
+
+    return {
+      ready,
+      teamASide,
+      teamBSide,
+      teamAPresent: teamAOnRadiant + teamAOnDire,
+      teamBPresent: teamBOnRadiant + teamBOnDire,
+      teamAMissingIds,
+      teamBMissingIds,
+      teamASplit,
+      teamBSplit,
+    };
+  }
+
   async invitePlayer(steamId32: string): Promise<void> {
     if (!this.isConnected) throw new Error('Not connected to Dota 2 GC');
 
-    // Convert Steam32 ID to Steam64 for the invite
     const accountId = parseInt(steamId32, 10);
     const steamId64 = this.steam32ToSteam64(accountId);
 
+    // GC invite — shows as a bell notification inside Dota 2
     this.dota2.inviteToLobby(steamId64);
+
+    // Steam friend message — appears as a chat notification even if Dota 2 is minimised
+    // or the player dismissed the GC bell. The steam://joinlobby deep link opens Dota 2
+    // and shows a join dialog when clicked.
+    const lobbyId = this.dota2.Lobby?.lobby_id ? String(this.dota2.Lobby.lobby_id) : null;
+    if (lobbyId) {
+      const joinUrl = `steam://joinlobby/570/${lobbyId}`;
+      const friendMsg = `You have been invited to a PD2IH lobby. Click to join: ${joinUrl}`;
+      this.steamFriends.sendMessage(
+        steamId64,
+        friendMsg,
+        Steam.EChatEntryType.ChatMsg
+      );
+      logger.debug(`Sent Steam friend join link to ${steamId32}: ${joinUrl}`);
+    } else {
+      logger.warn(`invitePlayer: lobby ID not available yet — Steam friend message skipped for ${steamId32}`);
+    }
+
     logger.debug(`Invited player ${steamId32} (${steamId64})`);
   }
 
@@ -220,8 +444,12 @@ export class DotaClient extends EventEmitter {
 
   async sendChatMessage(message: string): Promise<void> {
     if (!this.isConnected) throw new Error('Not connected to Dota 2 GC');
-    this.dota2.sendMessage(message, /* channel */ undefined, /* channel_type */ 1);
-    logger.debug(`Chat: ${message}`);
+    if (!this._lobbyChannelName) {
+      logger.warn('sendChatMessage called without an active lobby chat channel');
+      return;
+    }
+    this.dota2.sendMessage(message, this._lobbyChannelName, this.LOBBY_CHAT_TYPE);
+    logger.debug(`Chat [${this._lobbyChannelName}]: ${message}`);
   }
 
   async kickPlayer(steamId32: string): Promise<void> {
@@ -261,6 +489,9 @@ export class DotaClient extends EventEmitter {
           logger.warn('Error leaving lobby (non-fatal)', err);
         }
         this._currentLobby = null;
+        this._lobbyChannelName = null;
+        this._knownMemberIds.clear();
+        this.clearSessionTeams();
         resolve();
       });
     });
@@ -276,13 +507,15 @@ export class DotaClient extends EventEmitter {
     const members = (lobby.all_members || lobby.members || []) as Array<Record<string, unknown>>;
 
     return members.map((member) => {
-      const accountId = Number(member.id || member.account_id || 0);
+      // member.id is a Steam64 Long (the GC sends Steam64 IDs in CSODOTALobbyMember)
+      const accountId = this.steam64ToSteam32(member.id);
+      const steamId32 = accountId > 0 ? String(accountId) : '0';
       const slot = Number(member.slot ?? member.team_slot ?? -1);
       const team = this.slotToTeam(slot);
 
       return {
         accountId,
-        steamId32: String(accountId),
+        steamId32,
         slot,
         team,
         heroId: member.hero_id ? Number(member.hero_id) : undefined,
@@ -308,13 +541,53 @@ export class DotaClient extends EventEmitter {
     // Lobby state updates
     this.dota2.on('practiceLobbyUpdate', (lobby: unknown) => {
       this._currentLobby = lobby;
-      const players = this.getCurrentLobbyPlayers();
-      const teamNames = this.getLobbyTeamNames();
+
+      // Detect new joiners: compare current members against previously-seen set.
+      const lobbyData = lobby as Record<string, unknown>;
+      const members = (lobbyData.all_members || lobbyData.members || []) as Array<Record<string, unknown>>;
+      for (const m of members) {
+        const steam64   = String(m.id);
+        const accountId = this.steam64ToSteam32(m.id);
+        const steam32   = String(accountId);
+
+        if (!this._knownMemberIds.has(steam64)) {
+          this._knownMemberIds.add(steam64);
+
+          if (accountId > 0) {
+            // Auto-kick uninvited players when a session is active.
+            // Skip the bot itself (it's always the host and not in the invite list).
+            if (
+              this._allowedSteamId32s.size > 0 &&
+              steam32 !== this._botSteam32 &&
+              !this._allowedSteamId32s.has(steam32)
+            ) {
+              logger.warn(
+                `Auto-kicking uninvited player: Steam32=${steam32} Steam64=${steam64}`
+              );
+              this.dota2.practiceLobbyKick(accountId);
+              this.emit('playerKicked', { accountId, steamId64: steam64, reason: 'uninvited' });
+            } else {
+              logger.info(`Player joined lobby: Steam64=${steam64} accountId=${accountId}`);
+              // Delay emit slightly so the player's client has time to join
+              // the lobby chat channel before the caller sends a welcome message.
+              // (The GC lobby join fires ~1-2s before the chat channel join.)
+              setTimeout(() => {
+                this.emit('playerJoined', { accountId, steamId64: steam64 });
+              }, 2000);
+            }
+          }
+        }
+      }
+
+      const players    = this.getCurrentLobbyPlayers();
+      const teamNames  = this.getLobbyTeamNames();
+      const slotValidation = this.validateTeamSlots();
 
       this.emit('lobbyUpdate', {
         players,
         radiantTeamName: teamNames.radiant,
         direTeamName: teamNames.dire,
+        slotValidation,
       });
     });
 
@@ -326,6 +599,11 @@ export class DotaClient extends EventEmitter {
       chatData: Record<string, unknown>
     ) => {
       const accountId = Number(chatData.account_id || 0);
+      // Skip messages sent by the bot itself to prevent accidental command loops.
+      if (this._botSteam32 && String(accountId) === this._botSteam32) {
+        logger.debug(`Ignoring own chat message: "${message}"`);
+        return;
+      }
       this.emit('chatMessage', {
         accountId,
         steamId32: String(accountId),
@@ -343,23 +621,17 @@ export class DotaClient extends EventEmitter {
     this.dota2.on('practiceLobbyCleared', () => {
       logger.info('Lobby was cleared/destroyed');
       this._currentLobby = null;
+      this._knownMemberIds.clear();
+      this.clearSessionTeams();
       this.emit('lobbyCleared');
     });
 
-    // Steam disconnection
-    this.steam.on('disconnected', (_eresult: number, msg: string) => {
-      logger.warn(`Steam disconnected: ${msg}`);
+    // Steam disconnection (old steam package uses 'error' for disconnect too)
+    this.steamClient.on('error', (err: Error) => {
+      logger.warn(`Steam disconnected/error: ${err?.message ?? err}`);
       this._connected = false;
       this._inDota = false;
-      this.emit('disconnected', msg);
-    });
-
-    // Steam reconnection
-    this.steam.on('loggedOn', () => {
-      if (!this._connected) {
-        logger.info('Steam: Reconnected');
-        this._connected = true;
-      }
+      this.emit('disconnected', String(err?.message ?? err));
     });
   }
 
@@ -375,6 +647,16 @@ export class DotaClient extends EventEmitter {
     return 'unassigned';
   }
 
+  private steam64ToSteam32(idLong: unknown): number {
+    try {
+      const steam64 = BigInt(String(idLong));
+      const steam32 = steam64 - 76561197960265728n;
+      return steam32 > 0n ? Number(steam32) : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   private steam32ToSteam64(accountId: number): string {
     // Steam64 = accountId + 76561197960265728
     const base = BigInt('76561197960265728');
@@ -383,5 +665,16 @@ export class DotaClient extends EventEmitter {
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Maps a DotaTV delay in seconds to the LobbyDotaTVDelay enum value.
+   * LobbyDotaTV_10=0, LobbyDotaTV_120=1, LobbyDotaTV_300=2, LobbyDotaTV_900=3
+   */
+  private dotaTvSecondsToEnum(seconds: number): number {
+    if (seconds <= 10)  return 0; // LobbyDotaTV_10
+    if (seconds <= 120) return 1; // LobbyDotaTV_120
+    if (seconds <= 300) return 2; // LobbyDotaTV_300
+    return 3;                     // LobbyDotaTV_900
   }
 }
