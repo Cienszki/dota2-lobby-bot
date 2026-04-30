@@ -234,14 +234,15 @@ async function main(): Promise<void> {
   // ── Step 7: Slot validation check ─────────────────────────────────────
   section('STEP 7 — Slot validation (lobbyUpdate includes TeamSlotValidation)');
 
-  if (lastSlotValidation !== null) {
+  const capturedValidation = lastSlotValidation;
+  if (capturedValidation !== null) {
     pass('slotValidation is included in lobbyUpdate events');
-    info(`  ready: ${lastSlotValidation.ready}`);
-    info(`  Team A present: ${lastSlotValidation.teamAPresent}/5, missing: [${lastSlotValidation.teamAMissingIds.join(', ')}]`);
-    info(`  Team B present: ${lastSlotValidation.teamBPresent}/5, missing: [${lastSlotValidation.teamBMissingIds.join(', ')}]`);
-    info(`  Team A side: ${lastSlotValidation.teamASide ?? 'none'}, split: ${lastSlotValidation.teamASplit}`);
-    info(`  Team B side: ${lastSlotValidation.teamBSide ?? 'none'}, split: ${lastSlotValidation.teamBSplit}`);
-    record('slot validation in lobbyUpdate', 'pass', `ready=${lastSlotValidation.ready}`);
+    info(`  ready: ${capturedValidation.ready}`);
+    info(`  Team A present: ${capturedValidation.teamAPresent}/5, missing: [${capturedValidation.teamAMissingIds.join(', ')}]`);
+    info(`  Team B present: ${capturedValidation.teamBPresent}/5, missing: [${capturedValidation.teamBMissingIds.join(', ')}]`);
+    info(`  Team A side: ${capturedValidation.teamASide ?? 'none'}, split: ${capturedValidation.teamASplit}`);
+    info(`  Team B side: ${capturedValidation.teamBSide ?? 'none'}, split: ${capturedValidation.teamBSplit}`);
+    record('slot validation in lobbyUpdate', 'pass', `ready=${capturedValidation.ready}`);
   } else {
     // No lobbyUpdate with slotValidation yet — call validateTeamSlots directly
     const validation = client.validateTeamSlots();
