@@ -162,6 +162,7 @@ export class CommandHandler {
           fillWithBots: (settings.fillWithBots as boolean) || false,
           allowSpectators: (settings.allowSpectators as boolean) ?? true,
           pauseSetting: (settings.pauseSetting as number) || 1,
+          selectionPriorityRules: settings.selectionPriorityRules as number | undefined,
         });
 
         // Emit lobby_created event
@@ -210,6 +211,7 @@ export class CommandHandler {
               direTeamName,
               game1ForfeitMinutes: (latePolicy.game1ForfeitMinutes as number) ?? 15,
               seriesForfeitMinutes: (latePolicy.seriesForfeitMinutes as number) ?? 30,
+              waitExtensionMinutes: (latePolicy.waitExtensionMinutes as number) ?? 10,
               waitCommands: (latePolicy.waitCommands as string[]) ?? ['!wait'],
               forfeitCommands: (latePolicy.forfeitCommands as string[]) ?? ['!forfeit'],
               votingWindowSeconds: (latePolicy.votingWindowSeconds as number) ?? 60,

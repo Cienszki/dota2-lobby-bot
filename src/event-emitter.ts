@@ -112,6 +112,28 @@ export class EventBridge {
       this.handleLobbyCleared();
     });
 
+    // Coin toss: GC resolved which team has priority (after first launchPracticeLobby)
+    this.dotaClient.on('coinTossResult', (data: { priorityTeamId: string; priorityTeamId32: number }) => {
+      this.emitEvent({
+        type: 'coin_toss_result',
+        sessionId: this.currentSessionId,
+        priorityTeamId: data.priorityTeamId,
+        priorityTeamId32: data.priorityTeamId32,
+        timestamp: new Date().toISOString(),
+      });
+    });
+
+    // Coin toss: both teams completed their side/pick-order selection — game will launch now
+    this.dotaClient.on('coinTossSelectionComplete', (data: { priorityChoice: number; nonPriorityChoice: number }) => {
+      this.emitEvent({
+        type: 'coin_toss_selection_complete',
+        sessionId: this.currentSessionId,
+        priorityChoice: data.priorityChoice,
+        nonPriorityChoice: data.nonPriorityChoice,
+        timestamp: new Date().toISOString(),
+      });
+    });
+
     // Source TV data (for detecting game start/end)
     this.dotaClient.on('sourceTVData', (data: unknown) => {
       this.handleSourceTVData(data);

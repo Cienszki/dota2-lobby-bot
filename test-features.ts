@@ -3,6 +3,10 @@
  *
  * Tester: Cienszki (steamId32: 35747920 / steamId64: 76561197996013648)
  *
+ * NOTE: For fully automated testing without a human, use test-multi-bot.ts instead.
+ * This file is kept for interactive/manual regression sessions with Cienszki.
+ * See docs/TESTING_FLOW.md §3b for details.
+ *
  * Test sequence:
  *  1. Connect to Steam + Dota 2 GC
  *  2. Create a practice lobby (password: pd2ihtest)
@@ -14,7 +18,7 @@
  *  8. Leave lobby
  *
  * Usage:
- *   npx tsx test-features.ts
+ *   npx tsx bot-worker/test-features.ts
  */
 
 import dotenv from 'dotenv';

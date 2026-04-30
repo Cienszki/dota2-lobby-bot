@@ -25,6 +25,10 @@
 const Steam = require('steam');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const Dota2 = require('dota2');
+// node-dota2's _lobbyOptions whitelist does not include selection_priority_rules,
+// so it gets silently dropped by _parseOptions. Patch it in so the field is forwarded
+// to CMsgPracticeLobbySetDetails when creating/configuring a lobby.
+Dota2._lobbyOptions.selection_priority_rules = 'number';
 
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -69,6 +73,11 @@ export interface LobbyCreateOptions {
   fillWithBots: boolean;
   allowSpectators: boolean;
   pauseSetting: number;   // 0=unlimited, 1=limited, 2=disabled
+  /**
+   * 0 = Manual (coin toss + player picks side/pick order)
+   * 1 = Automatic (GC picks randomly, no player interaction) — default
+   */
+  selectionPriorityRules?: number;
 }
 
 export interface LobbyPlayerInfo {
@@ -139,6 +148,10 @@ export class DotaClient extends EventEmitter {
   // Team assignments for slot validation
   private _teamA = new Set<string>();
   private _teamB = new Set<string>();
+  // Coin toss (selection_priority_rules=0): tracks two-phase launch
+  private _selectionPriorityRules = 0; // 0=Manual (GC proto default), 1=Automatic (Coin Toss)
+  private _awaitingCoinTossSelection = false;
+  private _coinTossResultEmitted = false;
 
   constructor(private config: DotaClientConfig) {
     super();
@@ -264,6 +277,9 @@ export class DotaClient extends EventEmitter {
         fill_with_bots: options.fillWithBots,
         allow_spectating: options.allowSpectators,
         pause_setting: options.pauseSetting,
+        // 0=Manual (no coin toss, START GAME) — single launchPracticeLobby() call.
+        // 1=Automatic (coin toss, START PICK/SIDE SELECTION) — two-phase launch.
+        selection_priority_rules: options.selectionPriorityRules ?? 1,
       };
 
       if (options.radiantSeriesWins !== undefined) {
@@ -290,6 +306,10 @@ export class DotaClient extends EventEmitter {
             this._lobbyChannelName = `Lobby_${lobbyId}`;
             this.dota2.joinChat(this._lobbyChannelName, this.LOBBY_CHAT_TYPE);
             logger.info(`Lobby created — joined chat channel ${this._lobbyChannelName}`);
+            // Store the selection priority rule so startGame() knows which phase logic to use
+            this._selectionPriorityRules = options.selectionPriorityRules ?? 1;
+            this._awaitingCoinTossSelection = false;
+            this._coinTossResultEmitted = false;
             // Move bot out of Radiant slot 1 and into the unassigned player pool
             // so it doesn’t occupy a slot meant for human players.
             // joinPracticeLobbyTeam(slot, team): DOTA_GC_TEAM_PLAYER_POOL = 4
@@ -355,10 +375,11 @@ export class DotaClient extends EventEmitter {
       // Skip bot itself and invalid entries
       if (accountId <= 0 || steam32 === this._botSteam32) continue;
 
-      const slot = Number(m.slot ?? m.team_slot ?? -1);
-      if (slot >= SLOT.RADIANT_START && slot <= SLOT.RADIANT_END) {
+      const teamNum   = Number(m.team ?? -1);
+      const gcTeam    = this.gcTeamToString(teamNum);
+      if (gcTeam === 'radiant') {
         seatedRadiant.add(steam32);
-      } else if (slot >= SLOT.DIRE_START && slot <= SLOT.DIRE_END) {
+      } else if (gcTeam === 'dire') {
         seatedDire.add(steam32);
       }
     }
@@ -462,18 +483,32 @@ export class DotaClient extends EventEmitter {
   async startGame(): Promise<void> {
     if (!this.isConnected) throw new Error('Not connected to Dota 2 GC');
 
+    if (this._selectionPriorityRules === 1) {
+      // Coin toss mode (Automatic): this is Phase 1 — triggers the coin toss UI for players.
+      // Phase 2 (second launchPracticeLobby) fires automatically once the lobby
+      // update shows both teams have made their selection (see practiceLobbyUpdate handler).
+      this._awaitingCoinTossSelection = true;
+      this._coinTossResultEmitted = false;
+    }
+
     return new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
+        this._awaitingCoinTossSelection = false;
         reject(new Error('Game start timeout (30s)'));
       }, 30000);
 
       this.dota2.launchPracticeLobby((err: Error | null) => {
         clearTimeout(timeout);
         if (err) {
+          this._awaitingCoinTossSelection = false;
           logger.error('Failed to start game', err);
           reject(err);
         } else {
-          logger.info('Game launch initiated (coin toss)');
+          if (this._selectionPriorityRules === 1) {
+            logger.info('Coin toss triggered — waiting for player side/pick selections before launching');
+          } else {
+            logger.info('Game launch initiated (Manual selection priority)');
+          }
           resolve();
         }
       });
@@ -492,6 +527,8 @@ export class DotaClient extends EventEmitter {
         this._lobbyChannelName = null;
         this._knownMemberIds.clear();
         this.clearSessionTeams();
+        this._awaitingCoinTossSelection = false;
+        this._coinTossResultEmitted = false;
         resolve();
       });
     });
@@ -510,8 +547,12 @@ export class DotaClient extends EventEmitter {
       // member.id is a Steam64 Long (the GC sends Steam64 IDs in CSODOTALobbyMember)
       const accountId = this.steam64ToSteam32(member.id);
       const steamId32 = accountId > 0 ? String(accountId) : '0';
-      const slot = Number(member.slot ?? member.team_slot ?? -1);
-      const team = this.slotToTeam(slot);
+      // member.slot is per-team (0-4 within that side), NOT the global 0-9 seat.
+      // member.team is the DOTA_GC_TEAM enum: 0=Radiant, 1=Dire, 2=Broadcaster,
+      // 3=Spectator, 4=PlayerPool (unassigned). Use it directly.
+      const slot    = Number(member.slot ?? -1);
+      const teamNum = Number(member.team ?? -1);
+      const team    = this.gcTeamToString(teamNum);
 
       return {
         accountId,
@@ -524,15 +565,25 @@ export class DotaClient extends EventEmitter {
   }
 
   /**
-   * Get team names from current lobby
+   * Get team names from current lobby.
+   * The GC sends team info in lobby.team_details[] — an array of up to 2 entries.
+   * Index 0 = Radiant, index 1 = Dire. team_name is null when no team is selected.
    */
   getLobbyTeamNames(): { radiant: string; dire: string } {
     if (!this._currentLobby) return { radiant: '', dire: '' };
     const lobby = this._currentLobby as Record<string, unknown>;
-    return {
-      radiant: String(lobby.radiant_team_name || lobby.team_name_radiant || ''),
-      dire: String(lobby.dire_team_name || lobby.team_name_dire || ''),
-    };
+    const details = lobby.team_details as Array<Record<string, unknown>> | undefined;
+    const radiant = details?.[0]?.team_name ? String(details[0].team_name) : '';
+    const dire    = details?.[1]?.team_name ? String(details[1].team_name) : '';
+    return { radiant, dire };
+  }
+
+  /**
+   * Returns the raw lobby object for debugging.
+   * Use this to discover actual GC field names.
+   */
+  getRawLobby(): Record<string, unknown> | null {
+    return this._currentLobby as Record<string, unknown> | null;
   }
 
   // ─── Private Helpers ────────────────────────────────────────────────
@@ -589,6 +640,40 @@ export class DotaClient extends EventEmitter {
         direTeamName: teamNames.dire,
         slotValidation,
       });
+
+      // ─── Coin toss phase detection ─────────────────────────────────
+      // Only active when selectionPriorityRules=1 (Coin Toss) and startGame() was called.
+      if (this._awaitingCoinTossSelection) {
+        const priorityTeamId = lobbyData.series_current_selection_priority_team_id;
+        const priorityChoice    = Number(lobbyData.series_current_priority_team_choice    ?? 0);
+        const nonPriorityChoice = Number(lobbyData.series_current_non_priority_team_choice ?? 0);
+
+        // One-shot: emit the coin toss winner once priority team ID is set.
+        // Guard against Long(0) — protobuf returns a truthy Long object even when
+        // the field is 0 (no actual team ID assigned yet, e.g. without a leagueid).
+        const priorityTeamIdNum = Number(priorityTeamId ?? 0);
+        if (!this._coinTossResultEmitted && priorityTeamIdNum !== 0) {
+          this._coinTossResultEmitted = true;
+          const priorityTeamId32 = this.steam64ToSteam32(priorityTeamId);
+          logger.info(`Coin toss result: priority team steam32=${priorityTeamId32}`);
+          this.emit('coinTossResult', { priorityTeamId: String(priorityTeamId), priorityTeamId32 });
+        }
+
+        // Both teams chose → trigger Phase 2 (actual game launch)
+        if (priorityChoice > 0 && nonPriorityChoice > 0) {
+          this._awaitingCoinTossSelection = false;
+          logger.info(`Coin toss selections complete (priority=${priorityChoice} non-priority=${nonPriorityChoice}) — launching game`);
+          this.emit('coinTossSelectionComplete', { priorityChoice, nonPriorityChoice });
+          this.dota2.launchPracticeLobby((err: Error | null) => {
+            if (err) {
+              logger.error('Failed to launch game after coin toss selection', err);
+            } else {
+              logger.info('Game launched after coin toss selection');
+            }
+          });
+        }
+      }
+      // ──────────────────────────────────────────────────────────────
     });
 
     // Chat messages in lobby
@@ -623,6 +708,8 @@ export class DotaClient extends EventEmitter {
       this._currentLobby = null;
       this._knownMemberIds.clear();
       this.clearSessionTeams();
+      this._awaitingCoinTossSelection = false;
+      this._coinTossResultEmitted = false;
       this.emit('lobbyCleared');
     });
 
@@ -633,6 +720,17 @@ export class DotaClient extends EventEmitter {
       this._inDota = false;
       this.emit('disconnected', String(err?.message ?? err));
     });
+  }
+
+  private gcTeamToString(
+    teamNum: number
+  ): 'radiant' | 'dire' | 'spectator' | 'unassigned' {
+    // DOTA_GC_TEAM: 0=GoodGuys(Radiant), 1=BadGuys(Dire),
+    //               2=Broadcaster, 3=Spectator, 4=PlayerPool(unassigned)
+    if (teamNum === 0) return 'radiant';
+    if (teamNum === 1) return 'dire';
+    if (teamNum === 2 || teamNum === 3) return 'spectator';
+    return 'unassigned';
   }
 
   private slotToTeam(

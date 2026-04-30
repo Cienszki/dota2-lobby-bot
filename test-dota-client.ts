@@ -13,8 +13,11 @@
  *
  * Tester: Cienszki (steamId32: 35747920 / steamId64: 76561197996013648)
  *
+ * NOTE: For fully automated testing without a human, use test-multi-bot.ts instead.
+ * This file is kept for DotaClient wrapper regression. See docs/TESTING_FLOW.md §3d.
+ *
  * Usage:
- *   npx tsx test-dota-client.ts
+ *   npx tsx bot-worker/test-dota-client.ts
  */
 
 import dotenv from 'dotenv';

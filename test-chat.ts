@@ -3,6 +3,9 @@
  *
  * Tester: Cienszki (steamId32: 35747920 / steamId64: 76561197996013648)
  *
+ * NOTE: For fully automated testing without a human, use test-multi-bot.ts instead.
+ * This file is kept for interactive/manual sessions. See docs/TESTING_FLOW.md §3c.
+ *
  * What this test covers:
  *  1. Connect to Steam + Dota 2 GC
  *  2. Create practice lobby (bot in unassigned pool — no kick)
@@ -14,7 +17,7 @@
  *  8. Leave lobby
  *
  * Usage:
- *   npx tsx test-chat.ts
+ *   npx tsx bot-worker/test-chat.ts
  */
 
 import dotenv from 'dotenv';

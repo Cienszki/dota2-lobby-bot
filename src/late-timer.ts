@@ -25,6 +25,8 @@ export interface LateTimerConfig {
   direTeamName: string;
   game1ForfeitMinutes: number;
   seriesForfeitMinutes: number;
+  /** Minutes added when the present team votes to wait (default 10) */
+  waitExtensionMinutes: number;
   waitCommands: string[];
   forfeitCommands: string[];
   votingWindowSeconds: number;
@@ -259,7 +261,7 @@ export class LateTimer {
       });
 
     } else if (waitVotes >= this.cfg.requiredVotesForForfeit) {
-      const extraMinutes = 10;
+      const extraMinutes = this.cfg.waitExtensionMinutes;
       void this.callbacks.onSendChat(
         this.fill(this.cfg.waitResultTemplate, {
           present_team: presentTeamName,
