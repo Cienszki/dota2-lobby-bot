@@ -363,7 +363,7 @@ export class EventBridge {
         type: 'heartbeat',
         botAccountId: this.botAccountId,
         status: this.dotaClient.isConnected ? 'connected' : 'disconnected',
-        currentSessionId: this.currentSessionId || undefined,
+        currentSessionId: this.currentSessionId ?? null,
         timestamp: new Date().toISOString(),
       });
     } catch {
